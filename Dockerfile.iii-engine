@@ -1,0 +1,30 @@
+ARG III_VERSION=0.11.2
+
+FROM debian:bookworm-slim AS downloader
+ARG III_VERSION
+ARG TARGETARCH
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl tar busybox-static \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /tmp
+RUN case "$TARGETARCH" in \
+      amd64) III_ARCH='x86_64-unknown-linux-gnu' ;; \
+      arm64) III_ARCH='aarch64-unknown-linux-gnu' ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSLO "https://github.com/iii-hq/iii/releases/download/iii/v${III_VERSION}/iii-${III_ARCH}.tar.gz" \
+ && curl -fsSLO "https://github.com/iii-hq/iii/releases/download/iii/v${III_VERSION}/iii-${III_ARCH}.sha256" \
+ && sha256sum -c "iii-${III_ARCH}.sha256" \
+ && tar -xzf "iii-${III_ARCH}.tar.gz" \
+ && install -Dm0755 iii /out/usr/local/bin/iii \
+ && install -Dm0755 /bin/busybox /out/busybox
+
+FROM gcr.io/distroless/base-debian12:nonroot
+ARG III_VERSION
+LABEL org.opencontainers.image.title="iii-engine" \
+      org.opencontainers.image.description="Pinned iii-engine ${III_VERSION} image for air-gapped agentmemory deployments"
+COPY --from=downloader /out/ /
+COPY iii-config.yaml /etc/iii/config.yaml
+VOLUME ["/data"]
+EXPOSE 3112 49134
+ENTRYPOINT ["/usr/local/bin/iii", "--config", "/etc/iii/config.yaml", "--no-update-check"]
