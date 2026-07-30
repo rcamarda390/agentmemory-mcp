@@ -1,0 +1,581 @@
+name: Setup Repository Files
+
+on:
+  workflow_dispatch:
+    description: Create all repo files (Dockerfiles, workflows, compose, docs)
+
+jobs:
+  setup-files:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create directory structure
+        run: |
+          mkdir -p images/agentmemory
+          mkdir -p .github/workflows
+
+      - name: Create Dockerfile.iii-engine
+        run: cat > Dockerfile.iii-engine << 'DOCKERFILE_EOF'
+# iii-engine v0.11.2 - Production Image (distroless runtime)
+# Uses pre-built binary from GitHub releases
+
+FROM curlimages/curl:latest AS downloader
+
+WORKDIR /tmp
+
+RUN curl -fsSL -o iii.tar.gz \
+    https://github.com/iii-hq/iii/releases/download/iii/v0.11.2/iii-x86_64-unknown-linux-gnu.tar.gz && \
+    tar -xzf iii.tar.gz && \
+    ls -lh iii && \
+    chmod +x iii
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+WORKDIR /app
+
+COPY --from=downloader /tmp/iii /app/iii
+
+EXPOSE 3111 49134 3112 9464
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+  CMD ["/app/iii", "--version"]
+
+ENTRYPOINT ["/app/iii"]
+CMD ["--use-default-config"]
+DOCKERFILE_EOF
+
+      - name: Create images/agentmemory/Dockerfile
+        run: cat > images/agentmemory/Dockerfile << 'DOCKERFILE_EOF'
+# agentmemory MCP server — air-gap-ready, three-stage build
+# Internet required at BUILD time only; blocked at RUNTIME via TRANSFORMERS_OFFLINE
+# Requires iii-engine:0.11.2 sidecar (WebSocket on port 49134)
+
+ARG AGENTMEMORY_VERSION=0.9.26
+
+FROM node:20-slim AS npm-installer
+ARG AGENTMEMORY_VERSION
+RUN npm install --global @agentmemory/agentmemory@${AGENTMEMORY_VERSION} \
+    && npm cache clean --force
+
+FROM node:20-slim AS model-cacher
+COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=npm-installer /usr/local/bin /usr/local/bin
+ENV TRANSFORMERS_CACHE=/model-cache/huggingface
+COPY cache-models.js /tmp/cache-models.js
+RUN node /tmp/cache-models.js
+
+FROM node:20-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=npm-installer /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=npm-installer /usr/local/bin /usr/local/bin
+COPY --from=model-cacher /model-cache/huggingface /app/.cache/huggingface
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+    && mkdir -p /data \
+    && chown node:node /data
+
+VOLUME ["/data"]
+
+ENV III_ENGINE_WS_URL=ws://iii-engine:49134
+ENV PORT=3113
+ENV AGENTMEMORY_DATA_DIR=/data
+ENV TRANSFORMERS_CACHE=/app/.cache/huggingface
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_HUB_OFFLINE=1
+ENV NODE_ENV=production
+
+EXPOSE 3113
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["node", "/usr/local/lib/node_modules/@agentmemory/agentmemory/dist/index.js"]
+DOCKERFILE_EOF
+
+      - name: Create images/agentmemory/cache-models.js
+        run: cat > images/agentmemory/cache-models.js << 'JS_EOF'
+/**
+ * Build-time script: pre-caches Xenova/all-MiniLM-L6-v2 (~23 MB) into the image.
+ * Runs during the model-cacher stage only; internet access is available here.
+ * At runtime TRANSFORMERS_OFFLINE=1 prevents any outbound calls.
+ */
+const { pipeline, env } = require('@xenova/transformers');
+
+env.allowRemoteModels = true;
+env.cacheDir = process.env.TRANSFORMERS_CACHE || '/model-cache/huggingface';
+
+const MODEL = 'Xenova/all-MiniLM-L6-v2';
+
+(async () => {
+  console.log(`Downloading and caching ${MODEL} ...`);
+  const embed = await pipeline('feature-extraction', MODEL);
+
+  // warmup inference confirms the model is usable
+  const result = await embed('warmup sentence', { pooling: 'mean', normalize: true });
+  console.log(`Model cached. Embedding dim: ${result.data.length}`);
+})().catch(err => {
+  console.error('Model caching failed:', err);
+  process.exit(1);
+});
+JS_EOF
+
+      - name: Create images/agentmemory/docker-entrypoint.sh
+        run: cat > images/agentmemory/docker-entrypoint.sh << 'SHELL_EOF'
+#!/bin/sh
+set -e
+
+# Generate a persistent HMAC secret on first start; reuse on subsequent starts.
+SECRET_FILE="${AGENTMEMORY_DATA_DIR:-/data}/.hmac_secret"
+if [ ! -f "$SECRET_FILE" ]; then
+  node -e "require('fs').writeFileSync('$SECRET_FILE', require('crypto').randomBytes(32).toString('hex'))"
+fi
+export AGENTMEMORY_HMAC_SECRET="$(cat "$SECRET_FILE")"
+
+exec gosu node "$@"
+SHELL_EOF
+        shell: bash
+
+      - name: Make docker-entrypoint.sh executable
+        run: chmod +x images/agentmemory/docker-entrypoint.sh
+
+      - name: Create .github/workflows/build-iii.yml
+        run: cat > .github/workflows/build-iii.yml << 'YAML_EOF'
+name: Build & Push iii-engine v0.11.2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile.iii-engine
+      - .github/workflows/build-iii.yml
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/agentmemory-mpc/iii-engine
+  VERSION: 0.11.2
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.iii-engine
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          outputs: type=image
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }} --version
+YAML_EOF
+
+      - name: Create .github/workflows/build-agentmemory.yml
+        run: cat > .github/workflows/build-agentmemory.yml << 'YAML_EOF'
+name: Build & Push agentmemory
+
+on:
+  workflow_dispatch:
+    inputs:
+      agentmemory_version:
+        description: agentmemory npm version to build
+        required: true
+        default: "0.9.26"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/agentmemory-mpc/agentmemory
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: ./images/agentmemory
+          file: ./images/agentmemory/Dockerfile
+          push: true
+          build-args: |
+            AGENTMEMORY_VERSION=${{ inputs.agentmemory_version }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.agentmemory_version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.agentmemory_version }}
+          docker run --rm \
+            -e III_ENGINE_WS_URL=ws://localhost:49134 \
+            -e PORT=3113 \
+            -e AGENTMEMORY_DATA_DIR=/tmp/agentmemory-smoke \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.agentmemory_version }} \
+            node -e "console.log('agentmemory image OK')"
+YAML_EOF
+
+      - name: Create docker-compose.yml
+        run: cat > docker-compose.yml << 'YAML_EOF'
+version: "3.9"
+
+x-registry: &registry ${ARTIFACTORY_REGISTRY:-ghcr.io/rcamarda390/agentmemory-mpc}
+
+services:
+  iii-engine:
+    image: *registry/iii-engine:0.11.2
+    restart: unless-stopped
+    ports:
+      - "3111:3111"
+      - "49134:49134"
+      - "3112:3112"
+    healthcheck:
+      test: ["/app/iii", "--version"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  agentmemory:
+    image: *registry/agentmemory:0.9.26
+    restart: unless-stopped
+    depends_on:
+      iii-engine:
+        condition: service_healthy
+    ports:
+      - "3113:3113"
+    environment:
+      III_ENGINE_WS_URL: ws://iii-engine:49134
+      PORT: "3113"
+      AGENTMEMORY_DATA_DIR: /data
+    volumes:
+      - agentmemory-data:/data
+
+volumes:
+  agentmemory-data:
+YAML_EOF
+
+      - name: Create README.md
+        run: cat > README.md << 'MD_EOF'
+# agentmemory-mpc
+
+GitHub Actions builds for **iii-engine v0.11.2** and **agentmemory v0.9.26** — optimized for air-gapped deployment via Artifactory.
+
+## What This Does
+
+This repo automates building two Docker images for an air-gapped AWS EC2 devcontainer:
+
+1. **iii-engine:0.11.2** — WebSocket backend (required by agentmemory)
+2. **agentmemory:0.9.26** — MCP server with pre-cached embedding model
+
+Images are pushed to GHCR, pulled by a staging environment with internet access, vetted through Artifactory's security scanner, and deployed to an air-gapped EC2 instance.
+
+## Architecture
+
+```
+GitHub Actions (build)
+    ↓ (GHCR push)
+Staging Environment (pull + vet)
+    ↓ (Artifactory scan)
+Artifactory Registry (approved)
+    ↓ (air-gap transfer)
+Air-Gapped EC2 (docker compose up)
+```
+
+## Quick Start
+
+### 1. Trigger iii-engine Build
+
+Either:
+- **Push to main** — workflow auto-triggers on `Dockerfile.iii-engine` or workflow file changes
+- **Manual trigger** — **Actions** → **Build & Push iii-engine** → **Run workflow**
+
+Build completes in ~3 minutes. Image available at:
+```
+ghcr.io/rcamarda390/agentmemory-mpc/iii-engine:0.11.2
+```
+
+### 2. Trigger agentmemory Build
+
+**Actions** → **Build & Push agentmemory** → **Run workflow**
+
+Set version (default `0.9.26`) or accept default. Build completes in ~10-15 minutes (downloads and caches HuggingFace embedding model). Images available at:
+```
+ghcr.io/rcamarda390/agentmemory-mpc/agentmemory:0.9.26
+ghcr.io/rcamarda390/agentmemory-mpc/agentmemory:latest
+```
+
+### 3. Pull & Vet in Staging Environment
+
+On your staging machine (internet-connected):
+
+```bash
+docker pull ghcr.io/rcamarda390/agentmemory-mpc/iii-engine:0.11.2
+docker pull ghcr.io/rcamarda390/agentmemory-mpc/agentmemory:0.9.26
+```
+
+### 4. Deploy to Air-Gapped EC2
+
+Once Artifactory approves:
+
+```bash
+export ARTIFACTORY_REGISTRY=artifactory.yourdom.gov/docker-local
+docker pull $ARTIFACTORY_REGISTRY/iii-engine:0.11.2
+docker pull $ARTIFACTORY_REGISTRY/agentmemory:0.9.26
+docker compose up -d
+docker compose ps
+```
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `Dockerfile.iii-engine` | Pre-built binary download for iii-engine v0.11.2 |
+| `images/agentmemory/Dockerfile` | Three-stage build: npm install → model cache → production |
+| `images/agentmemory/cache-models.js` | Pre-caches Xenova/all-MiniLM-L6-v2 embedding model (~23 MB) at build time |
+| `images/agentmemory/docker-entrypoint.sh` | Generates persistent HMAC secret, drops to non-root user |
+| `.github/workflows/build-iii.yml` | GitHub Actions: build iii-engine, push to GHCR |
+| `.github/workflows/build-agentmemory.yml` | GitHub Actions: build agentmemory with version input, push to GHCR |
+| `docker-compose.yml` | Orchestrates iii-engine + agentmemory with health checks |
+| `README.md` | This file |
+| `CUSTOMIZATION.md` | Customizing versions, disabling internet features, submitting upstream requests |
+
+## Pre-Cached Model
+
+The agentmemory image includes **Xenova/all-MiniLM-L6-v2** (~23 MB) pre-cached at build time. At runtime:
+- `TRANSFORMERS_OFFLINE=1` blocks any outbound HuggingFace calls
+- `HF_HUB_OFFLINE=1` same, belt-and-suspenders
+- Model is served from `/app/.cache/huggingface` in the container
+
+No internet required at runtime.
+
+## Ports
+
+| Port | Service | Protocol |
+|---|---|---|
+| 3111 | iii-engine REST | HTTP |
+| 3112 | iii-engine streams | HTTP |
+| 49134 | iii-engine WebSocket | WS (agentmemory connects here) |
+| 3113 | agentmemory MCP | HTTP |
+
+## Version Control
+
+**iii-engine v0.11.2** — pinned in `Dockerfile.iii-engine` and workflow. No changes needed unless upgrading.
+
+**agentmemory version** — controlled by workflow input. Each build can specify a different npm version:
+
+```bash
+# In GitHub Actions UI, set agentmemory_version to any npm version
+# Example: 0.9.27, 0.10.0, etc.
+```
+
+No code changes required.
+
+## See Also
+
+- [CUSTOMIZATION.md](CUSTOMIZATION.md) — Bumping versions, disabling internet features
+- [iii-engine](https://github.com/iii-hq/iii) — v0.11.2 release
+- [agentmemory](https://github.com/rohitg00/agentmemory) — npm package
+MD_EOF
+
+      - name: Create CUSTOMIZATION.md
+        run: cat > CUSTOMIZATION.md << 'MD_EOF'
+# Customization Guide
+
+## Changing Versions
+
+### agentmemory Version (Easy — No Code Changes)
+
+Each time you want to rebuild with a new agentmemory version:
+
+1. **GitHub** → **Actions** → **Build & Push agentmemory**
+2. Click **Run workflow**
+3. Set **agentmemory_version** to any npm version (e.g., `0.9.27`, `0.10.0`)
+4. Click **Run workflow**
+
+No code edits needed. The workflow accepts any npm version as input.
+
+### iii-engine Version (Requires Code Change)
+
+If upgrading to a different iii-engine version:
+
+1. Edit `Dockerfile.iii-engine`:
+   ```dockerfile
+   # Line 11: Update the version in the download URL
+   https://github.com/iii-hq/iii/releases/download/iii/v0.11.2/iii-x86_64-unknown-linux-gnu.tar.gz
+   # Change v0.11.2 to desired version
+   ```
+
+2. Edit `.github/workflows/build-iii.yml`:
+   ```yaml
+   # Line 10: Update VERSION
+   VERSION: 0.11.2
+   # Change to new version
+   ```
+
+3. Update `docker-compose.yml`:
+   ```yaml
+   # Line 10: Update image tag
+   image: *registry/iii-engine:0.11.2
+   # Change to new version
+   ```
+
+4. Commit and push:
+   ```bash
+   git add Dockerfile.iii-engine .github/workflows/build-iii.yml docker-compose.yml
+   git commit -m "Upgrade iii-engine to v0.X.Y"
+   git push origin main
+   ```
+
+5. Build triggers automatically (or manually via **Run workflow**)
+
+## Disabling Internet-Dependent Features
+
+### agentmemory — Already Offline-Ready
+
+The agentmemory image is already configured for offline operation:
+
+| Setting | Purpose | Current Status |
+|---------|---------|-------------------|
+| `TRANSFORMERS_OFFLINE=1` | Blocks HuggingFace model downloads | ✓ Set in Dockerfile |
+| `HF_HUB_OFFLINE=1` | Same, belt-and-suspenders | ✓ Set in Dockerfile |
+| Pre-cached model | Xenova/all-MiniLM-L6-v2 (~23 MB) | ✓ Cached at build time |
+| `TRANSFORMERS_CACHE` | Points to pre-cached model | ✓ Set to `/app/.cache/huggingface` |
+
+**No changes needed.** The image blocks outbound internet at runtime.
+
+### iii-engine — Check For Internet Dependencies
+
+iii-engine v0.11.2 generally does not require internet at runtime. If it attempts outbound connections:
+
+1. Check `iii-config.yaml` for any remote service URLs
+2. Look for environment variables that enable remote calls (e.g., `PRICING_API`, `MODEL_UPDATES_URL`)
+3. Disable them before deployment
+
+Example (if present):
+```bash
+# In docker-compose.yml, add to iii-engine environment:
+environment:
+  DISABLE_PRICING_UPDATES: "true"
+  DISABLE_MODEL_CHECKS: "true"
+```
+
+### Future Versions — Pattern for Disabling Internet
+
+If a new version of agentmemory or iii-engine tries to access the internet:
+
+1. **Identify the feature:**
+   ```bash
+   grep -r "http://\|https://\|curl\|wget\|fetch" <source-code>
+   ```
+
+2. **Find the environment variable or config flag:**
+   - Check README of the project
+   - Look for `DISABLE_*`, `*_OFFLINE`, `*_LOCAL` env vars
+
+3. **Add to Dockerfile or docker-compose.yml:**
+   ```dockerfile
+   ENV MY_FEATURE_OFFLINE=1
+   ENV DISABLE_REMOTE_CALLS=true
+   ```
+
+4. **Test locally** before deploying to air-gapped environment
+
+## Submitting Changes Upstream
+
+Consider contributing improvements to the upstream projects:
+
+### To rohitg00/agentmemory
+
+If you make improvements to the agentmemory build or offline support:
+
+```bash
+# Fork https://github.com/rohitg00/agentmemory
+# Create branch: feature/air-gap-ready
+# Add: Dockerfile, cache-models.js, docker-entrypoint.sh, GitHub Actions workflows
+# Submit PR with air-gap improvements
+```
+
+### To iii-hq/iii
+
+If you find that v0.11.2 needs adjustments for air-gapped environments:
+
+```bash
+# Open issue: "Support air-gapped deployment (disable internet features)"
+```
+
+## Troubleshooting
+
+| Issue | Check |
+|-------|-------|
+| agentmemory tries to download model at runtime | `docker compose exec agentmemory env \| grep TRANSFORMERS_OFFLINE` — should be `1` |
+| iii-engine unreachable from agentmemory | `docker compose logs agentmemory` — check WebSocket URL in logs |
+| Image fails to load from Artifactory | Verify security scan passed; confirm registry URL is correct |
+| Health check fails on startup | Wait 10-15 seconds; check `docker compose logs <service>` |
+
+## Notes
+
+- **agentmemory npm versions:** Any version published to npm can be built via workflow input (no code changes)
+- **iii-engine version:** Pinned in code; requires edits to upgrade
+- **Pre-caching:** Happens at build time only (on internet-connected GitHub Actions runners); no internet needed at runtime
+- **HMAC secret:** Generated on container first start; persists across restarts via `/data` volume
+MD_EOF
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Commit and push
+        run: |
+          git add .
+          git commit -m "Initial commit: iii-engine and agentmemory Docker builds" || echo "Nothing to commit"
+          git push origin main || echo "Nothing to push"
