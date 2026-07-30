@@ -15,6 +15,7 @@ services:
     volumes:
       - iii-data:/data
     ports:
+      - "3111:3111"
       - "3112:3112"
       - "49134:49134"
     healthcheck:
@@ -37,10 +38,9 @@ services:
     volumes:
       - agentmemory-data:/data
     ports:
-      - "3111:3111"
       - "3113:3113"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3111/agentmemory/livez').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://iii-engine:3111/agentmemory/livez').then((response) => process.exit(response.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 6

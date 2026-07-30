@@ -27,6 +27,8 @@ ARTIFACTORY_REGISTRY=artifactory.example.gov/containers docker compose up -d
 - Dockerfile: `/home/runner/work/agentmemory-mcp/agentmemory-mcp/Dockerfile.iii-engine`
 - Source: iii `v0.11.2` release binary downloaded from GitHub releases
 - Base image: distroless
+- Runtime role: hosts the MCP/REST surface on `3111`, stream worker on `3112`,
+  and WebSocket worker bridge on `49134`
 - Workflow: `.github/workflows/build-iii.yml`
 - Trigger: push to `main` when the iii Dockerfile/config changes, or manual dispatch
 
@@ -35,8 +37,10 @@ ARTIFACTORY_REGISTRY=artifactory.example.gov/containers docker compose up -d
 - Dockerfile: `/home/runner/work/agentmemory-mcp/agentmemory-mcp/Dockerfile.agentmemory`
 - Source: `@agentmemory/agentmemory` npm package
 - Build stages: `npm-install` -> `model-cache` -> `production`
-- Runtime: pre-cached `Xenova/all-MiniLM-L6-v2`, offline HuggingFace settings,
-  `gosu` privilege drop, first-boot HMAC secret generation
+- Runtime role: registers the agentmemory worker against `iii-engine`, serves the
+  viewer on `3113`, pre-caches `Xenova/all-MiniLM-L6-v2`, forces offline
+  HuggingFace runtime settings, drops privileges with `gosu`, and generates a
+  persistent HMAC secret on first boot
 - Workflow: `.github/workflows/build-agentmemory.yml`
 - Trigger: manual dispatch with a package version input; publishes both the
   requested tag and `latest`
@@ -54,6 +58,8 @@ docker compose config
 - `iii-engine` persists engine state in the `iii-data` volume.
 - `agentmemory` persists the generated HMAC secret in the `agentmemory-data`
   volume.
+- The split deployment exposes `/agentmemory/livez` and `/agentmemory/health`
+  through `iii-engine:3111` after the agentmemory worker connects.
 - Runtime outbound model downloads are disabled with `TRANSFORMERS_OFFLINE=1`
   and `HF_HUB_OFFLINE=1`.
 - No tarball artifacts are produced; the deliverable is the pushed container

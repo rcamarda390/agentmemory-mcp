@@ -1,20 +1,22 @@
 ARG III_VERSION=0.11.2
+ARG CURL_INSECURE=0
 
 FROM debian:bookworm-slim AS downloader
 ARG III_VERSION
 ARG TARGETARCH
+ARG CURL_INSECURE
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl tar busybox-static \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 RUN case "$TARGETARCH" in \
-      amd64) III_ARCH='x86_64-unknown-linux-gnu' ;; \
-      arm64) III_ARCH='aarch64-unknown-linux-gnu' ;; \
+      amd64) III_ARCH='x86_64-unknown-linux-gnu'; III_SHA256='9c83c47788b4ef4beeb65dd9bf37e94f993770cd3db874464c3ce1cdc92352cd' ;; \
+      arm64) III_ARCH='aarch64-unknown-linux-gnu'; III_SHA256='e0d35ee54a6b6c8a46576ab661e1711d11eb4dafeb1be8e1dbd1cc0ccb48b615' ;; \
       *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac \
- && curl -fsSLO "https://github.com/iii-hq/iii/releases/download/iii/v${III_VERSION}/iii-${III_ARCH}.tar.gz" \
- && curl -fsSLO "https://github.com/iii-hq/iii/releases/download/iii/v${III_VERSION}/iii-${III_ARCH}.sha256" \
- && sha256sum -c "iii-${III_ARCH}.sha256" \
+ && if [ "$CURL_INSECURE" = '1' ]; then CURL_FLAGS='-k'; else CURL_FLAGS=''; fi \
+ && curl -fsSL $CURL_FLAGS -o "iii-${III_ARCH}.tar.gz" "https://github.com/iii-hq/iii/releases/download/iii/v${III_VERSION}/iii-${III_ARCH}.tar.gz" \
+ && echo "$III_SHA256  iii-${III_ARCH}.tar.gz" | sha256sum -c - \
  && tar -xzf "iii-${III_ARCH}.tar.gz" \
  && install -Dm0755 iii /out/usr/local/bin/iii \
  && install -Dm0755 /bin/busybox /out/busybox
